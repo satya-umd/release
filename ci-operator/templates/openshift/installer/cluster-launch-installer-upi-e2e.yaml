@@ -21,6 +21,8 @@ parameters:
 - name: BASE_DOMAIN
   value: origin-ci-int-aws.dev.rhcloud.com
   required: true
+- name: TEST_CUSTOM_ENDPOINT
+  value: "false"
 
 objects:
 
@@ -316,6 +318,50 @@ objects:
 
         if [[ "${CLUSTER_TYPE}" == "aws" ]]; then
           MACHINE_CIDR=10.0.0.0/16
+
+
+          # FIXME: get epel-release or otherwise add awscli to our UPI image
+          export PATH="${HOME}/.local/bin:${PATH}"
+          easy_install --user pip  # our Python 2.7.5 is even too old for ensurepip
+          pip install --user awscli
+
+          TAGS="Key=expirationDate,Value=${EXPIRATION_DATE}"
+
+          aws cloudformation create-stack  --stack-name "${CLUSTER_NAME}-vpc" \
+            --template-body "$(cat "/var/lib/openshift-install/upi/${CLUSTER_TYPE}/cloudformation/01_vpc.yaml")" \
+            --tags "${TAGS}" \
+            --parameters \
+              ParameterKey=AvailabilityZoneCount,ParameterValue=3 &
+          wait "$!"
+
+          aws cloudformation wait stack-create-complete --stack-name "${CLUSTER_NAME}-vpc" &
+          wait "$!"
+
+          VPC_JSON="$(aws cloudformation describe-stacks --stack-name "${CLUSTER_NAME}-vpc" \
+            --query 'Stacks[].Outputs[]' --output json)"
+          
+          VPC_ID="$(echo "${VPC_JSON}" | jq -r '.[] | select(.OutputKey == "VpcId").OutputValue')"
+          PRIVATE_SUBNETS="$(echo "${VPC_JSON}" | jq '.[] | select(.OutputKey == "PrivateSubnetIds").OutputValue')"  # explicitly keeping wrapping quotes
+          PRIVATE_SUBNET_0="$(echo "${PRIVATE_SUBNETS}" | sed 's/"//g' | cut -d, -f1)"
+          PRIVATE_SUBNET_1="$(echo "${PRIVATE_SUBNETS}" | sed 's/"//g' | cut -d, -f2)"
+          PRIVATE_SUBNET_2="$(echo "${PRIVATE_SUBNETS}" | sed 's/"//g' | cut -d, -f3)"
+          PUBLIC_SUBNETS="$(echo "${VPC_JSON}" | jq '.[] | select(.OutputKey == "PublicSubnetIds").OutputValue')"  # explicitly keeping wrapping quotes
+          SECURITY_GROUPS="$(echo "${VPC_JSON}" | jq -r '.[] | select(.OutputKey == "SecurityGroups").OutputValue')"
+          # Test Custom Endpoints
+          if [[ "${TEST_CUSTOM_ENDPOINT}" == "true"]]; then
+          VPC_ENDPOINT_JSON="$(aws ec2 create-vpc-endpoint \
+          --vpc-id ${VPC_ID} \
+          --vpc-endpoint-type Interface \
+          --service-name com.amazonaws.us-east-1.ec2 \
+          --subnet-ids ${PUBLIC_SUBNETS} ${PRIVATE_SUBNETS} \
+          --security-group-ids ${SECURITY_GROUPS} \
+          --output json)"
+          EC2_CUSTOM_ENDPOINT = "$(echo "${VPC_ENDPOINT_JSON}" | jq -r '.VpcEndpoint.DnsEntries[0].DnsName')"
+            CUSTOM_ENDPOINT="customRegionOverride:
+        - service: ec2
+          url: ${EC2_CUSTOM_ENDPOINT}"
+          fi
+
           cat > /tmp/artifacts/installer/install-config.yaml << EOF
         apiVersion: v1
         baseDomain: ${BASE_DOMAIN}
@@ -339,6 +385,7 @@ objects:
               - ${AWS_REGION}a
               - ${AWS_REGION}b
               - ${AWS_REGION}c
+              ${CUSTOM_ENDPOINT}
         networking:
           machineCIDR: ${MACHINE_CIDR}
         platform:
@@ -351,7 +398,7 @@ objects:
         sshKey: |
           ${SSH_PUB_KEY}
         EOF
-
+          cat > /tmp/artifacts/installer/install-config.yaml
           openshift-install --dir=/tmp/artifacts/installer create manifests
           rm -f /tmp/artifacts/installer/openshift/99_openshift-cluster-api_master-machines-*.yaml /tmp/artifacts/installer/openshift/99_openshift-cluster-api_worker-machinesets-*.yaml
         elif [[ "${CLUSTER_TYPE}" == "vsphere" ]]; then
@@ -408,15 +455,9 @@ objects:
         if [[ "${CLUSTER_TYPE}" == "aws" ]]; then
           RHCOS_AMI=ami-0df3f99538fbef10f  # FIXME: assumes AWS_REGION is us-east-1
 
-          # FIXME: get epel-release or otherwise add awscli to our UPI image
-          export PATH="${HOME}/.local/bin:${PATH}"
-          easy_install --user pip  # our Python 2.7.5 is even too old for ensurepip
-          pip install --user awscli
-
           export AWS_DEFAULT_REGION="${AWS_REGION}"  # CLI prefers the former
 
           INFRA_ID="$(jq -r .infraID /tmp/artifacts/installer/metadata.json)"
-          TAGS="Key=expirationDate,Value=${EXPIRATION_DATE}"
           IGNITION_CA="$(jq '.ignition.security.tls.certificateAuthorities[0].source' /tmp/artifacts/installer/master.ign)"  # explicitly keeping wrapping quotes
 
           HOSTED_ZONE="$(aws route53 list-hosted-zones-by-name \
@@ -424,24 +465,7 @@ objects:
             --query "HostedZones[? Config.PrivateZone != \`true\` && Name == \`${BASE_DOMAIN}.\`].Id" \
             --output text)"
 
-          aws cloudformation create-stack  --stack-name "${CLUSTER_NAME}-vpc" \
-            --template-body "$(cat "/var/lib/openshift-install/upi/${CLUSTER_TYPE}/cloudformation/01_vpc.yaml")" \
-            --tags "${TAGS}" \
-            --parameters \
-              ParameterKey=AvailabilityZoneCount,ParameterValue=3 &
-          wait "$!"
 
-          aws cloudformation wait stack-create-complete --stack-name "${CLUSTER_NAME}-vpc" &
-          wait "$!"
-
-          VPC_JSON="$(aws cloudformation describe-stacks --stack-name "${CLUSTER_NAME}-vpc" \
-            --query 'Stacks[].Outputs[]' --output json)"
-          VPC_ID="$(echo "${VPC_JSON}" | jq -r '.[] | select(.OutputKey == "VpcId").OutputValue')"
-          PRIVATE_SUBNETS="$(echo "${VPC_JSON}" | jq '.[] | select(.OutputKey == "PrivateSubnetIds").OutputValue')"  # explicitly keeping wrapping quotes
-          PRIVATE_SUBNET_0="$(echo "${PRIVATE_SUBNETS}" | sed 's/"//g' | cut -d, -f1)"
-          PRIVATE_SUBNET_1="$(echo "${PRIVATE_SUBNETS}" | sed 's/"//g' | cut -d, -f2)"
-          PRIVATE_SUBNET_2="$(echo "${PRIVATE_SUBNETS}" | sed 's/"//g' | cut -d, -f3)"
-          PUBLIC_SUBNETS="$(echo "${VPC_JSON}" | jq '.[] | select(.OutputKey == "PublicSubnetIds").OutputValue')"  # explicitly keeping wrapping quotes
 
           aws cloudformation create-stack \
             --stack-name "${CLUSTER_NAME}-infra" \
